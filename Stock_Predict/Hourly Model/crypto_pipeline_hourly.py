@@ -1,10 +1,11 @@
 import os
+import time
 import argparse
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import requests
 import xgboost as xgb
 import matplotlib.pyplot as plt
 from sklearn.model_selection import TimeSeriesSplit
@@ -30,8 +31,24 @@ MODEL_PATH = os.path.join(MODEL_DIR, "crypto_xgboost_model_hourly.json")
 
 CRYPTO_TICKERS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "DOGE-USD"]
 
+# Binance trades against USDT, not USD, but for our purposes (a stablecoin
+# pegged ~1:1 to the dollar) the price series is close enough to treat the
+# same way the old Yahoo USD pairs were treated.
+BINANCE_SYMBOLS = {
+    "BTC-USD": "BTCUSDT",
+    "ETH-USD": "ETHUSDT",
+    "SOL-USD": "SOLUSDT",
+    "BNB-USD": "BNBUSDT",
+    "DOGE-USD": "DOGEUSDT",
+}
+
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_KLINE_LIMIT = 1000
+BINANCE_EARLIEST_START = "2017-01-01"  # Binance itself only launched mid-2017;
+                                        # each symbol just clips to its real listing date
+
 INTERVAL = "1h"
-FETCH_PERIOD = "730d"     # Yahoo's hard cap for 1h-interval data
 
 HORIZON_HOURS = 10        # predict: will price rise X% within the next 10 hours?
 EMBARGO_HOURS = HORIZON_HOURS
@@ -40,25 +57,15 @@ VAL_FRACTION = 0.15
 N_CV_SPLITS = 5
 RANDOM_STATE = 42
 
-# A 3% move in 2 days (the daily model's target) is a much bigger ask than a
-# 3% move in 10 hours. Volatility scales roughly with sqrt(time), and
-# 10h / 48h ~= 0.21, sqrt(0.21) ~= 0.46, so 3% * 0.46 ~= 1.4%. Rounded to a
-# clean 1.5% starting point -- watch the printed "positive rate" after a run
-# and adjust up/down per coin if it looks too rare or too common.
 TARGET_THRESHOLDS = {t: 0.015 for t in CRYPTO_TICKERS}
-
 BULLISH_PROB_THRESHOLD = 0.45
 
 FEATURE_COLUMNS = [
     'sma_14', 'sma_50', 'macd', 'macd_signal', 'rsi_14',
     'daily_return', 'volatility_14d', 'volatility_30d', 'volume_ratio'
 ]
-# Note: these still use 14/50/30-PERIOD windows -- now that's 14/50/30 HOURS
-# of lookback instead of days, which fits a 10-hour-ahead target much better
-# than a multi-week window would. Column names kept as-is so the rest of the
-# code (and your daily script) stay easy to compare side by side.
 
-FETCH_FRESHNESS_HOURS = 1        # refetch if raw data is older than this
+FETCH_FRESHNESS_HOURS = 1        # only check-in with Binance for new bars this often
 MIN_HOURS_BETWEEN_RETRAIN = 6    # don't retrain more often than this
 
 
@@ -93,37 +100,122 @@ def needs_train():
 
 
 # ==========================================================================
-# Stage 1: Fetch
+# Binance helpers
+# ==========================================================================
+def _binance_get(url, params, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+
+
+def fetch_binance_klines(symbol, interval, start_str):
+    """Paginate Binance's klines endpoint (1000 candles/request) from start_str to now."""
+    start_ts = int(pd.Timestamp(start_str, tz="UTC").timestamp() * 1000)
+    end_ts = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+
+    all_rows = []
+    cur = start_ts
+    while cur < end_ts:
+        batch = _binance_get(BINANCE_KLINES_URL, {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cur,
+            "limit": BINANCE_KLINE_LIMIT,
+        })
+        if not batch:
+            break
+        all_rows.extend(batch)
+        if len(batch) < BINANCE_KLINE_LIMIT:
+            break
+        cur = batch[-1][0] + 1
+        time.sleep(0.15)  # be polite to the free public API
+    return all_rows
+
+
+def klines_to_df(rows, ticker):
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=[
+        'OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime',
+        'QuoteAssetVolume', 'NumTrades', 'TakerBuyBase', 'TakerBuyQuote', 'Ignore'
+    ])
+    df['Date'] = pd.to_datetime(df['OpenTime'], unit='ms')
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        df[col] = df[col].astype(float)
+    df['Ticker'] = ticker
+    return df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Ticker']]
+
+
+def get_current_live_price(ticker, fallback_price):
+    symbol = BINANCE_SYMBOLS.get(ticker)
+    if symbol:
+        try:
+            data = _binance_get(BINANCE_PRICE_URL, {"symbol": symbol}, max_retries=2)
+            return round(float(data["price"]), 2)
+        except Exception:
+            pass
+    return round(float(fallback_price), 2)
+
+
+# ==========================================================================
+# Stage 1: Fetch (incremental after the first full backfill)
 # ==========================================================================
 def fetch_data(force=False):
     if not force and not needs_fetch():
-        print(f"[1/4] Fetch: raw hourly data is under {FETCH_FRESHNESS_HOURS}h old, skipping.")
+        print(f"[1/4] Fetch: checked for new bars under {FETCH_FRESHNESS_HOURS}h ago, skipping.")
         return
 
-    print(f"[1/4] Fetch: downloading {FETCH_PERIOD} of {INTERVAL} bars for {len(CRYPTO_TICKERS)} coins...")
-    all_data = []
-    for ticker in CRYPTO_TICKERS:
-        print(f"  Downloading {ticker} ({INTERVAL}, {FETCH_PERIOD})...")
-        df = yf.download(ticker, period=FETCH_PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
-        if df.empty:
-            print(f"  WARNING: no data returned for {ticker}, skipping it.")
-            continue
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.reset_index()
-        # Intraday intervals come back with an index named 'Datetime', not 'Date'
-        if 'Datetime' in df.columns:
-            df = df.rename(columns={'Datetime': 'Date'})
-        df['Date'] = pd.to_datetime(df['Date'], utc=True).dt.tz_localize(None)
-        df['Ticker'] = ticker
-        all_data.append(df)
+    existing_df = None
+    if not force and os.path.exists(RAW_DATA_PATH):
+        existing_df = pd.read_csv(RAW_DATA_PATH)
+        existing_df['Date'] = pd.to_datetime(existing_df['Date'])
 
-    if not all_data:
+    print(f"[1/4] Fetch: pulling {INTERVAL} bars from Binance for {len(CRYPTO_TICKERS)} coins...")
+    new_frames = []
+    for ticker in CRYPTO_TICKERS:
+        symbol = BINANCE_SYMBOLS.get(ticker)
+        if not symbol:
+            print(f"  WARNING: no Binance symbol mapping for {ticker}, skipping.")
+            continue
+
+        if existing_df is not None and (existing_df['Ticker'] == ticker).any():
+            last_ts = existing_df.loc[existing_df['Ticker'] == ticker, 'Date'].max()
+            start_str = (last_ts + pd.Timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"  {ticker} -> {symbol}: incremental update since {start_str}")
+        else:
+            start_str = BINANCE_EARLIEST_START
+            print(f"  {ticker} -> {symbol}: full history backfill from {start_str} (this can take a minute)...")
+
+        rows = fetch_binance_klines(symbol, INTERVAL, start_str)
+        df = klines_to_df(rows, ticker)
+        if not df.empty:
+            print(f"    +{len(df)} bars ({df['Date'].min()} -> {df['Date'].max()})")
+        new_frames.append(df)
+
+    new_combined = pd.concat([d for d in new_frames if not d.empty], ignore_index=True) if any(len(d) for d in new_frames) else pd.DataFrame()
+
+    if existing_df is not None and not new_combined.empty:
+        combined_df = pd.concat([existing_df, new_combined], ignore_index=True)
+    elif existing_df is not None:
+        combined_df = existing_df
+    else:
+        combined_df = new_combined
+
+    if combined_df.empty:
         raise RuntimeError("Fetch failed for every ticker -- check your internet connection.")
 
-    combined_df = pd.concat(all_data, ignore_index=True)
+    combined_df = (combined_df
+                   .drop_duplicates(subset=['Ticker', 'Date'])
+                   .sort_values(['Ticker', 'Date'])
+                   .reset_index(drop=True))
     combined_df.to_csv(RAW_DATA_PATH, index=False)
-    print(f"  Saved {len(combined_df)} hourly rows to '{RAW_DATA_PATH}'")
+    print(f"  Saved {len(combined_df)} total hourly rows to '{RAW_DATA_PATH}'")
 
 
 # ==========================================================================
@@ -178,8 +270,7 @@ def engineer_features(force=False):
 
 
 # ==========================================================================
-# Stage 3: Train (chronological split + embargo, same leak-fix as the daily
-# script -- just measured in hours instead of days now)
+# Stage 3: Train (chronological split + embargo)
 # ==========================================================================
 def train_model(force=False):
     if not force and not needs_train():
@@ -195,7 +286,8 @@ def train_model(force=False):
     df['target'] = df['target'].astype(int)
     df = df.sort_values('Date').reset_index(drop=True)
 
-    print(f"  {len(df)} rows, positive rate {df['target'].mean():.3%}")
+    print(f"  {len(df)} rows, positive rate {df['target'].mean():.3%}, "
+          f"date range {df['Date'].min()} -> {df['Date'].max()}")
 
     timestamps = np.sort(df['Date'].unique())
     n_ts = len(timestamps)
@@ -264,17 +356,6 @@ def train_model(force=False):
 # ==========================================================================
 # Stage 4: Predict + report (always runs)
 # ==========================================================================
-def get_current_live_price(ticker, fallback_price):
-    try:
-        t = yf.Ticker(ticker)
-        price = t.fast_info.get('lastPrice')
-        if price is not None and not np.isnan(price):
-            return round(float(price), 2)
-    except Exception:
-        pass
-    return round(float(fallback_price), 2)
-
-
 def categorize_signal(prob):
     if prob >= BULLISH_PROB_THRESHOLD:
         return f"BULLISH (P >= {BULLISH_PROB_THRESHOLD})"
@@ -359,8 +440,8 @@ def predict_and_report():
 # Entry point
 # ==========================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Hourly crypto signal pipeline (10-hour horizon)")
-    parser.add_argument("--force", action="store_true", help="Redo every step from scratch")
+    parser = argparse.ArgumentParser(description="Hourly crypto signal pipeline (10-hour horizon, Binance data)")
+    parser.add_argument("--force", action="store_true", help="Redo every step from scratch (full Binance backfill)")
     parser.add_argument("--force-train", action="store_true", help="Retrain now, ignoring the retrain cooldown")
     args = parser.parse_args()
 
